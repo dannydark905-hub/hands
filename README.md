@@ -11,8 +11,9 @@ it is a single PowerShell script.
 | `Windows10-Debloat-GUI.ps1` | The tool itself (WinForms GUI). |
 | `Install-DebloatTool.ps1` | Installs the tool to Program Files, adds shortcuts and an Add/Remove Programs entry. |
 | `Uninstall-DebloatTool.ps1` | Removes the files, shortcuts and registry entry. |
+| `installer/Windows10DebloatTool.iss` | Inno Setup source for a compiled `Setup.exe` (optional). |
 
-## Install
+## Install (script)
 
 Right-click `Install-DebloatTool.ps1` → **Run with PowerShell**, or:
 
@@ -32,6 +33,19 @@ Optional parameters:
 .\Install-DebloatTool.ps1 -NoDesktopShortcut               # Start Menu only
 .\Install-DebloatTool.ps1 -Quiet                           # no closing dialog
 ```
+
+## Install (compiled Setup.exe, optional)
+
+The script installer above needs no toolchain. If you want a normal `Setup.exe`
+instead, build the Inno Setup source on Windows with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
+
+```powershell
+iscc.exe installer\Windows10DebloatTool.iss
+```
+
+Output lands in `dist\Windows10DebloatTool-Setup.exe`. It stages the same files,
+creates the same elevated shortcuts, and registers its own uninstaller in
+Add/Remove Programs.
 
 ## Run without installing
 
