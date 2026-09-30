@@ -8,10 +8,14 @@
     click Run. Progress and results are shown live in the log pane and
     saved to Debloat-Log.txt next to the script.
 
+    The list is populated for the Windows 10 app set. If the tool is run
+    on Windows 11 the additional Windows 11-only packages are appended
+    automatically.
+
 .NOTES
     - Self-elevates: if you don't run it as Administrator, it will
       relaunch itself with a UAC prompt.
-    - Nothing runs until you click "Run Selected".
+    - Nothing runs until you click "Run Selected" and confirm the summary.
     - Everything it does is reversible via the System Restore Point it
       offers to create, or by re-enabling toggles / reinstalling apps.
 
@@ -38,14 +42,50 @@ if (-not $IsAdmin) {
     exit
 }
 
+# DPI awareness must be set before any window is created, otherwise the UI
+# is bitmap-scaled (blurry) on high-DPI displays. The type only exists on
+# .NET Framework 4.7+, so it is created defensively.
+try {
+    Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class DpiHelper {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+"@ -ErrorAction Stop
+    [void][DpiHelper]::SetProcessDPIAware()
+} catch { }
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ------------------------------------------------------------------
+# PLATFORM DETECTION
+# ------------------------------------------------------------------
+function Get-PlatformInfo {
+    try {
+        $v = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+        $name = $v.ProductName
+        $build = [int]$v.CurrentBuildNumber
+        if ($name -notmatch 'Windows 1[01]') { $name = "Windows 10/11" }
+        $family = if ($build -ge 22000) { "Windows 11" } else { "Windows 10" }
+        return [pscustomobject]@{
+            ProductName = $name
+            Family      = $family
+            Build       = $build
+            Version     = $v.DisplayVersion
+        }
+    } catch {
+        return [pscustomobject]@{ ProductName = "Windows"; Family = "Windows 10"; Build = 0; Version = "" }
+    }
+}
+$script:Platform = Get-PlatformInfo
+
+# ------------------------------------------------------------------
 # DATA: apps available for removal (DisplayName shown in list, Id used to match packages)
 # ------------------------------------------------------------------
 $AppCatalog = @(
+    # --- Windows 10 bloat ---
     @{ Display = "3D Builder / 3D Viewer";        Id = "*3DBuilder*";  Group = "Bloat" }
     @{ Display = "Cortana";                        Id = "Microsoft.549981C3F5F10"; Group = "Bloat" }
     @{ Display = "Bing Weather";                   Id = "Microsoft.BingWeather"; Group = "Bloat" }
@@ -82,6 +122,13 @@ $AppCatalog = @(
     @{ Display = "Power Automate Desktop";         Id = "Microsoft.PowerAutomateDesktop"; Group = "Bloat" }
     @{ Display = "New Outlook";                    Id = "Microsoft.OutlookForWindows"; Group = "Bloat" }
     @{ Display = "Clipchamp";                      Id = "Clipchamp.Clipchamp"; Group = "Bloat" }
+    @{ Display = "Web Experience Pack (widgets/news feed)"; Id = "MicrosoftWindows.Client.WebExperience"; Group = "Bloat" }
+    # --- Windows 11 only (filtered out on Windows 10) ---
+    @{ Display = "Widgets Platform Runtime";       Id = "Microsoft.WidgetsPlatformRuntime"; Group = "Bloat"; MinBuild = 22000 }
+    @{ Display = "Windows Copilot";                Id = "Microsoft.Copilot"; Group = "Bloat"; MinBuild = 22000 }
+    @{ Display = "Xbox Game Bar (Win11)";          Id = "Microsoft.XboxGamingOverlay"; Group = "Bloat"; MinBuild = 22000 }
+    @{ Display = "Quick Assist (Win11)";           Id = "Microsoft.QuickAssist"; Group = "Bloat"; MinBuild = 22000 }
+    # --- OEM trials ---
     @{ Display = "Facebook (OEM)";                 Id = "*Facebook*"; Group = "OEM" }
     @{ Display = "Twitter (OEM)";                  Id = "*Twitter*"; Group = "OEM" }
     @{ Display = "Spotify (OEM)";                  Id = "*Spotify*"; Group = "OEM" }
@@ -91,6 +138,11 @@ $AppCatalog = @(
     @{ Display = "McAfee (OEM)";                   Id = "*McAfee*"; Group = "OEM" }
     @{ Display = "Dolby Access (OEM)";              Id = "*Dolby*"; Group = "OEM" }
 )
+
+function Get-CuratedApps {
+    $build = $script:Platform.Build
+    return @($AppCatalog | Where-Object { -not $_.MinBuild -or $build -ge $_.MinBuild })
+}
 
 # ------------------------------------------------------------------
 # LOGGING
@@ -110,10 +162,16 @@ function Write-Log {
 }
 
 # ------------------------------------------------------------------
-# APP LIST HELPERS (curated list vs. live scan of what's installed)
+# APP LIST MODEL
+#
+# The checked set is tracked as a hashtable of Ids ($script:Checked), never by
+# list index. The list box is only a view of $script:CurrentApps, so filtering
+# or reloading it can never desync the selection from the backing data.
 # ------------------------------------------------------------------
-$script:ViewMode = "Curated"   # "Curated" | "InstalledAppx" | "Desktop"
-$script:CurrentApps = $AppCatalog
+$script:ViewMode    = "Curated"   # "Curated" | "InstalledAppx" | "Desktop"
+$script:CurrentApps = Get-CuratedApps
+$script:Checked     = @{}
+$script:Filter      = ""
 
 function Get-InstalledAppItems {
     Write-Log "Scanning installed Store (UWP) apps (this can take a few seconds)..." "Yellow"
@@ -180,44 +238,132 @@ function Get-DesktopAppItems {
 function Set-AppListItems {
     param($Items, [bool]$DefaultChecked = $true)
     $script:CurrentApps = $Items
-    $AppList.Items.Clear()
-    foreach ($it in $Items) {
-        [void]$AppList.Items.Add($it.Display, $DefaultChecked)
+    $script:Checked = @{}
+    if ($DefaultChecked) {
+        foreach ($it in $Items) { $script:Checked[$it.Id] = $true }
     }
+    $script:Filter = ""
+    $SearchBox.Clear()
+    Update-ListDisplay
+}
+
+function Get-VisibleApps {
+    if ($script:Filter) { return @($script:CurrentApps | Where-Object { $_.Display -like "*$script:Filter*" }) }
+    return @($script:CurrentApps)
+}
+
+function Update-ListDisplay {
+    $AppList.BeginUpdate()
+    try {
+        $AppList.Items.Clear()
+        foreach ($it in Get-VisibleApps) {
+            $text = $it.Display
+            if ($it.ContainsKey("Installed")) {
+                $text += if ($it.Installed) { "  -  Installed" } else { "  -  Not installed" }
+            }
+            [void]$AppList.Items.Add($text, [bool]$script:Checked[$it.Id])
+        }
+    } finally {
+        $AppList.EndUpdate()
+    }
+    Update-ListSummary
+}
+
+function Update-ListSummary {
+    $visible = @(Get-VisibleApps)
+    $checked = @($script:Checked.Keys | Where-Object { $script:Checked[$_] }).Count
+    $StatusLabel.Text = "Showing $($visible.Count) of $($script:CurrentApps.Count) item(s) - $checked selected - $($script:Platform.Family) (build $($script:Platform.Build))."
 }
 
 function Load-View {
-    param([string]$Mode, [switch]$PreserveChecks)
-    $checkedIds = @()
-    if ($PreserveChecks) {
-        for ($i = 0; $i -lt $AppList.Items.Count; $i++) {
-            if ($AppList.GetItemChecked($i)) { $checkedIds += $script:CurrentApps[$i].Id }
-        }
-    }
+    param([string]$Mode)
     switch ($Mode) {
         "Curated" {
-            Set-AppListItems -Items $AppCatalog -DefaultChecked:$true
+            Set-AppListItems -Items (Get-CuratedApps) -DefaultChecked:$true
         }
         "InstalledAppx" {
             $items = Get-InstalledAppItems
             Set-AppListItems -Items $items -DefaultChecked:$false
             # Pre-check anything matching a known bloat/OEM pattern for convenience
-            for ($i = 0; $i -lt $script:CurrentApps.Count; $i++) {
-                $id = $script:CurrentApps[$i].Id
-                if ($AppCatalog | Where-Object { $id -like $_.Id }) { $AppList.SetItemChecked($i, $true) }
+            $catalog = Get-CuratedApps
+            foreach ($it in $items) {
+                if ($catalog | Where-Object { $it.Id -like $_.Id }) { $script:Checked[$it.Id] = $true }
             }
+            Update-ListDisplay
         }
         "Desktop" {
             $items = Get-DesktopAppItems
             Set-AppListItems -Items $items -DefaultChecked:$false
         }
     }
-    if ($PreserveChecks) {
-        for ($i = 0; $i -lt $script:CurrentApps.Count; $i++) {
-            if ($checkedIds -contains $script:CurrentApps[$i].Id) { $AppList.SetItemChecked($i, $true) }
-        }
-    }
     $script:ViewMode = $Mode
+}
+
+# ------------------------------------------------------------------
+# PRESETS
+# ------------------------------------------------------------------
+function Apply-Preset {
+    param([string]$Name)
+    # Safe: leave browsers, comms, media and Store-adjacent apps alone.
+    $safeKeep = @(
+        "Microsoft.WindowsCamera", "Microsoft.WindowsAlarms", "Microsoft.WindowsSoundRecorder",
+        "Microsoft.WindowsMaps", "Microsoft.MicrosoftStickyNotes", "Microsoft.People",
+        "microsoft.windowscommunicationsapps", "Microsoft.YourPhone", "MicrosoftTeams",
+        "Microsoft.Todos", "Microsoft.PowerAutomateDesktop", "Microsoft.OutlookForWindows",
+        "Microsoft.MicrosoftOfficeHub", "Microsoft.Office.OneNote", "Microsoft.Office.Sway"
+    )
+
+    foreach ($app in $script:CurrentApps) {
+        $check = switch ($Name) {
+            "Safe"        { -not ($safeKeep -contains $app.Id) }
+            "Recommended" { $true }
+            "Aggressive"  { $true }
+            default       { [bool]$script:Checked[$app.Id] }
+        }
+        $script:Checked[$app.Id] = [bool]$check
+    }
+    switch ($Name) {
+        "Safe"        { $chkRestore.Checked = $true; $chkTelemetry.Checked = $true; $chkAds.Checked = $true; $chk3D.Checked = $false }
+        "Recommended" { $chkRestore.Checked = $true; $chkTelemetry.Checked = $true; $chkAds.Checked = $true; $chk3D.Checked = $true }
+        "Aggressive"  { $chkRestore.Checked = $true; $chkTelemetry.Checked = $true; $chkAds.Checked = $true; $chk3D.Checked = $true }
+    }
+    Update-ListDisplay
+}
+
+# ------------------------------------------------------------------
+# RESULT TRACKING
+# ------------------------------------------------------------------
+$script:Results = @()
+function Add-Result {
+    param([string]$Name, [string]$Outcome)
+    $script:Results += [pscustomobject]@{ Name = $Name; Outcome = $Outcome }
+}
+
+function Show-Results {
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = "Fill"
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AutoSizeColumnsMode = "Fill"
+    $grid.RowHeadersVisible = $false
+    $grid.DataSource = $script:Results
+    if ($grid.Columns.Count -ge 2) {
+        $grid.Columns[0].HeaderText = "Item"
+        $grid.Columns[1].HeaderText = "Result"
+    }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Run Results ($($script:Results.Count) item(s))"
+    $dlg.Size = New-Object System.Drawing.Size(620, 460)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.MinimizeBox = $false
+    $close = New-Object System.Windows.Forms.Button
+    $close.Text = "Close"
+    $close.Dock = "Bottom"
+    $close.Add_Click({ $dlg.Close() })
+    $dlg.Controls.Add($grid)
+    $dlg.Controls.Add($close)
+    [void]$dlg.ShowDialog($Form)
 }
 
 # ------------------------------------------------------------------
@@ -225,61 +371,132 @@ function Load-View {
 # ------------------------------------------------------------------
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "Windows 10 Debloat Tool"
-$Form.Size = New-Object System.Drawing.Size(720, 760)
+$Form.Size = New-Object System.Drawing.Size(780, 800)
+$Form.MinimumSize = New-Object System.Drawing.Size(700, 640)
 $Form.StartPosition = "CenterScreen"
-$Form.FormBorderStyle = "FixedDialog"
-$Form.MaximizeBox = $false
+$Form.FormBorderStyle = "Sizable"
+$Form.MaximizeBox = $true
 $Form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 
+# --- Title / platform banner ---
 $TitleLabel = New-Object System.Windows.Forms.Label
 $TitleLabel.Text = "Select apps to remove and options to apply, then click Run."
-$TitleLabel.Location = New-Object System.Drawing.Point(15, 12)
-$TitleLabel.Size = New-Object System.Drawing.Size(680, 20)
+$TitleLabel.Location = New-Object System.Drawing.Point(15, 10)
+$TitleLabel.Size = New-Object System.Drawing.Size(600, 20)
+$TitleLabel.Anchor = "Top,Left,Right"
 $Form.Controls.Add($TitleLabel)
 
-# --- App checklist ---
+$PlatformLabel = New-Object System.Windows.Forms.Label
+$PlatformLabel.Text = "$($script:Platform.ProductName) (build $($script:Platform.Build)) - $($script:Platform.Family) app list loaded."
+$PlatformLabel.Location = New-Object System.Drawing.Point(15, 30)
+$PlatformLabel.Size = New-Object System.Drawing.Size(600, 18)
+$PlatformLabel.Anchor = "Top,Left,Right"
+$PlatformLabel.ForeColor = [System.Drawing.Color]::DimGray
+$Form.Controls.Add($PlatformLabel)
+
+# --- View / preset / filter row ---
 $ViewLabel = New-Object System.Windows.Forms.Label
 $ViewLabel.Text = "View:"
-$ViewLabel.Location = New-Object System.Drawing.Point(15, 40)
-$ViewLabel.Size = New-Object System.Drawing.Size(40, 20)
+$ViewLabel.Location = New-Object System.Drawing.Point(15, 58)
+$ViewLabel.Size = New-Object System.Drawing.Size(38, 20)
 $Form.Controls.Add($ViewLabel)
 
 $ViewCombo = New-Object System.Windows.Forms.ComboBox
 $ViewCombo.DropDownStyle = "DropDownList"
-$ViewCombo.Location = New-Object System.Drawing.Point(55, 37)
-$ViewCombo.Size = New-Object System.Drawing.Size(380, 24)
+$ViewCombo.Location = New-Object System.Drawing.Point(53, 55)
+$ViewCombo.Size = New-Object System.Drawing.Size(240, 24)
 [void]$ViewCombo.Items.AddRange(@("Curated Bloat List", "Installed Store (UWP) Apps", "Installed Desktop Programs"))
 $ViewCombo.SelectedIndex = 0
 $Form.Controls.Add($ViewCombo)
 
+$PresetLabel = New-Object System.Windows.Forms.Label
+$PresetLabel.Text = "Preset:"
+$PresetLabel.Location = New-Object System.Drawing.Point(303, 58)
+$PresetLabel.Size = New-Object System.Drawing.Size(48, 20)
+$Form.Controls.Add($PresetLabel)
+
+$PresetCombo = New-Object System.Windows.Forms.ComboBox
+$PresetCombo.DropDownStyle = "DropDownList"
+$PresetCombo.Location = New-Object System.Drawing.Point(351, 55)
+$PresetCombo.Size = New-Object System.Drawing.Size(150, 24)
+[void]$PresetCombo.Items.AddRange(@("Custom", "Safe", "Recommended", "Aggressive"))
+$PresetCombo.SelectedIndex = 1
+$Form.Controls.Add($PresetCombo)
+
+$SearchLabel = New-Object System.Windows.Forms.Label
+$SearchLabel.Text = "Filter:"
+$SearchLabel.Location = New-Object System.Drawing.Point(511, 58)
+$SearchLabel.Size = New-Object System.Drawing.Size(38, 20)
+$Form.Controls.Add($SearchLabel)
+
+$SearchBox = New-Object System.Windows.Forms.TextBox
+$SearchBox.Location = New-Object System.Drawing.Point(549, 55)
+$SearchBox.Size = New-Object System.Drawing.Size(215, 24)
+$SearchBox.Anchor = "Top,Right"
+$Form.Controls.Add($SearchBox)
+
+# --- App checklist ---
 $AppList = New-Object System.Windows.Forms.CheckedListBox
-$AppList.Location = New-Object System.Drawing.Point(15, 66)
-$AppList.Size = New-Object System.Drawing.Size(420, 372)
+$AppList.Location = New-Object System.Drawing.Point(15, 84)
+$AppList.Size = New-Object System.Drawing.Size(470, 430)
 $AppList.CheckOnClick = $true
-foreach ($app in $script:CurrentApps) {
-    [void]$AppList.Items.Add($app.Display, $true)
-}
+$AppList.IntegralHeight = $false
+$AppList.Anchor = "Top,Bottom,Left,Right"
 $Form.Controls.Add($AppList)
 
+# Curated view starts with everything checked (as in the original tool).
+foreach ($app in $script:CurrentApps) { $script:Checked[$app.Id] = $true }
+
+# Keep the model in sync when the user ticks boxes. The list only ever shows
+# Get-VisibleApps() in order, so the item index maps to that sequence (not to
+# $script:CurrentApps directly, which a filter can shorten).
+$AppList.Add_ItemCheck({
+    param($sender, $e)
+    $visible = Get-VisibleApps
+    if ($e.Index -ge 0 -and $e.Index -lt $visible.Count) {
+        $script:Checked[$visible[$e.Index].Id] = ($e.NewValue -eq [System.Windows.Forms.CheckState]::Checked)
+    }
+    Update-ListSummary
+})
+
+# --- List buttons ---
 $SelectAllBtn = New-Object System.Windows.Forms.Button
 $SelectAllBtn.Text = "Select All"
-$SelectAllBtn.Location = New-Object System.Drawing.Point(15, 444)
-$SelectAllBtn.Size = New-Object System.Drawing.Size(95, 26)
-$SelectAllBtn.Add_Click({ for ($i = 0; $i -lt $AppList.Items.Count; $i++) { $AppList.SetItemChecked($i, $true) } })
+$SelectAllBtn.Location = New-Object System.Drawing.Point(15, 522)
+$SelectAllBtn.Size = New-Object System.Drawing.Size(100, 26)
+$SelectAllBtn.Anchor = "Bottom,Left"
+$SelectAllBtn.Add_Click({
+    foreach ($it in Get-VisibleApps) { $script:Checked[$it.Id] = $true }
+    Update-ListDisplay
+})
 $Form.Controls.Add($SelectAllBtn)
 
 $SelectNoneBtn = New-Object System.Windows.Forms.Button
 $SelectNoneBtn.Text = "Select None"
-$SelectNoneBtn.Location = New-Object System.Drawing.Point(115, 444)
-$SelectNoneBtn.Size = New-Object System.Drawing.Size(95, 26)
-$SelectNoneBtn.Add_Click({ for ($i = 0; $i -lt $AppList.Items.Count; $i++) { $AppList.SetItemChecked($i, $false) } })
+$SelectNoneBtn.Location = New-Object System.Drawing.Point(120, 522)
+$SelectNoneBtn.Size = New-Object System.Drawing.Size(100, 26)
+$SelectNoneBtn.Anchor = "Bottom,Left"
+$SelectNoneBtn.Add_Click({
+    foreach ($it in Get-VisibleApps) { $script:Checked[$it.Id] = $false }
+    Update-ListDisplay
+})
 $Form.Controls.Add($SelectNoneBtn)
 
 $RefreshBtn = New-Object System.Windows.Forms.Button
 $RefreshBtn.Text = "Refresh"
-$RefreshBtn.Location = New-Object System.Drawing.Point(215, 444)
-$RefreshBtn.Size = New-Object System.Drawing.Size(95, 26)
+$RefreshBtn.Location = New-Object System.Drawing.Point(225, 522)
+$RefreshBtn.Size = New-Object System.Drawing.Size(100, 26)
+$RefreshBtn.Anchor = "Bottom,Left"
 $Form.Controls.Add($RefreshBtn)
+
+$ResultsBtn = New-Object System.Windows.Forms.Button
+$ResultsBtn.Text = "View Results"
+$ResultsBtn.Location = New-Object System.Drawing.Point(330, 522)
+$ResultsBtn.Size = New-Object System.Drawing.Size(100, 26)
+$ResultsBtn.Anchor = "Bottom,Left"
+$ResultsBtn.Enabled = $false
+$ResultsBtn.Add_Click({ Show-Results })
+$Form.Controls.Add($ResultsBtn)
 
 $ViewCombo.Add_SelectedIndexChanged({
     $ViewCombo.Enabled = $false; $RefreshBtn.Enabled = $false; $RunBtn.Enabled = $false
@@ -294,8 +511,18 @@ $ViewCombo.Add_SelectedIndexChanged({
             Write-Log "Be careful with shared runtimes (Visual C++ Redistributables, .NET, drivers) - other apps may depend on them." "Yellow"
         }
     }
-    $StatusLabel.Text = "Showing $($script:CurrentApps.Count) item(s) - $($ViewCombo.SelectedItem)."
     $ViewCombo.Enabled = $true; $RefreshBtn.Enabled = $true; $RunBtn.Enabled = $true
+})
+
+$PresetCombo.Add_SelectedIndexChanged({
+    if ($PresetCombo.SelectedItem -eq "Custom") { return }
+    Apply-Preset -Name $PresetCombo.SelectedItem
+    Write-Log "Applied preset: $($PresetCombo.SelectedItem)." "Cyan"
+})
+
+$SearchBox.Add_TextChanged({
+    $script:Filter = $SearchBox.Text.Trim()
+    Update-ListDisplay
 })
 
 $RefreshBtn.Add_Click({
@@ -305,27 +532,24 @@ $RefreshBtn.Add_Click({
     switch ($script:ViewMode) {
         "Curated" {
             Write-Log "Refreshing installed status for the curated list..." "Yellow"
-            for ($i = 0; $i -lt $script:CurrentApps.Count; $i++) {
-                $app = $script:CurrentApps[$i]
-                $wasChecked = $AppList.GetItemChecked($i)
+            foreach ($app in $script:CurrentApps) {
                 $isInstalled = [bool](Get-AppxPackage -AllUsers -Name $app.Id -ErrorAction SilentlyContinue)
                 if (-not $isInstalled) {
                     $isInstalled = [bool](Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like $app.Id })
                 }
-                $suffix = if ($isInstalled) { "  -  Installed" } else { "  -  Not installed" }
-                $AppList.Items[$i] = "$($app.Display)$suffix"
-                $AppList.SetItemChecked($i, $wasChecked)
+                $app.Installed = $isInstalled
             }
+            Update-ListDisplay
             $StatusLabel.Text = "Refreshed install status for the curated list."
         }
         "InstalledAppx" {
             Write-Log "Refreshing installed Store apps..." "Yellow"
-            Load-View -Mode "InstalledAppx" -PreserveChecks
+            Load-View -Mode "InstalledAppx"
             $StatusLabel.Text = "Refreshed. Showing $($script:CurrentApps.Count) installed Store apps."
         }
         "Desktop" {
             Write-Log "Refreshing installed desktop programs..." "Yellow"
-            Load-View -Mode "Desktop" -PreserveChecks
+            Load-View -Mode "Desktop"
             $StatusLabel.Text = "Refreshed. Showing $($script:CurrentApps.Count) installed desktop programs."
         }
     }
@@ -336,107 +560,143 @@ $RefreshBtn.Add_Click({
 # --- Options panel ---
 $OptionsBox = New-Object System.Windows.Forms.GroupBox
 $OptionsBox.Text = "Options"
-$OptionsBox.Location = New-Object System.Drawing.Point(450, 38)
-$OptionsBox.Size = New-Object System.Drawing.Size(245, 400)
+$OptionsBox.Location = New-Object System.Drawing.Point(500, 55)
+$OptionsBox.Size = New-Object System.Drawing.Size(264, 460)
+$OptionsBox.Anchor = "Top,Right,Bottom"
 $Form.Controls.Add($OptionsBox)
 
 $chkRestore = New-Object System.Windows.Forms.CheckBox
 $chkRestore.Text = "Create System Restore Point"
 $chkRestore.Location = New-Object System.Drawing.Point(15, 30)
-$chkRestore.Size = New-Object System.Drawing.Size(220, 40)
+$chkRestore.Size = New-Object System.Drawing.Size(235, 40)
 $chkRestore.Checked = $true
 $OptionsBox.Controls.Add($chkRestore)
 
 $chkAllUsers = New-Object System.Windows.Forms.CheckBox
 $chkAllUsers.Text = "Remove apps for all users (not just this account)"
 $chkAllUsers.Location = New-Object System.Drawing.Point(15, 75)
-$chkAllUsers.Size = New-Object System.Drawing.Size(220, 40)
+$chkAllUsers.Size = New-Object System.Drawing.Size(235, 40)
 $chkAllUsers.Checked = $true
 $OptionsBox.Controls.Add($chkAllUsers)
 
 $chkTelemetry = New-Object System.Windows.Forms.CheckBox
 $chkTelemetry.Text = "Reduce telemetry (diagnostic data, DiagTrack service, CEIP tasks)"
 $chkTelemetry.Location = New-Object System.Drawing.Point(15, 120)
-$chkTelemetry.Size = New-Object System.Drawing.Size(220, 50)
+$chkTelemetry.Size = New-Object System.Drawing.Size(235, 50)
 $chkTelemetry.Checked = $true
 $OptionsBox.Controls.Add($chkTelemetry)
 
 $chkAds = New-Object System.Windows.Forms.CheckBox
 $chkAds.Text = "Disable Start menu / lock screen ads and suggestions"
 $chkAds.Location = New-Object System.Drawing.Point(15, 175)
-$chkAds.Size = New-Object System.Drawing.Size(220, 50)
+$chkAds.Size = New-Object System.Drawing.Size(235, 50)
 $chkAds.Checked = $true
 $OptionsBox.Controls.Add($chkAds)
 
 $chk3D = New-Object System.Windows.Forms.CheckBox
 $chk3D.Text = "Remove '3D Objects' from This PC"
 $chk3D.Location = New-Object System.Drawing.Point(15, 230)
-$chk3D.Size = New-Object System.Drawing.Size(220, 40)
+$chk3D.Size = New-Object System.Drawing.Size(235, 40)
 $chk3D.Checked = $true
 $OptionsBox.Controls.Add($chk3D)
 
 $NoteLabel = New-Object System.Windows.Forms.Label
 $NoteLabel.Text = "Windows Defender, Windows Update, drivers, and core apps (Store, Calculator, Notepad, Photos, Terminal) are never touched."
 $NoteLabel.Location = New-Object System.Drawing.Point(15, 285)
-$NoteLabel.Size = New-Object System.Drawing.Size(220, 100)
+$NoteLabel.Size = New-Object System.Drawing.Size(235, 120)
+$NoteLabel.Anchor = "Top,Bottom,Left,Right"
 $NoteLabel.ForeColor = [System.Drawing.Color]::DimGray
 $OptionsBox.Controls.Add($NoteLabel)
 
 # --- Run / Close buttons ---
 $RunBtn = New-Object System.Windows.Forms.Button
 $RunBtn.Text = "Run Selected"
-$RunBtn.Location = New-Object System.Drawing.Point(450, 444)
-$RunBtn.Size = New-Object System.Drawing.Size(120, 32)
+$RunBtn.Location = New-Object System.Drawing.Point(500, 522)
+$RunBtn.Size = New-Object System.Drawing.Size(130, 32)
+$RunBtn.Anchor = "Bottom,Right"
 $RunBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
 $RunBtn.ForeColor = [System.Drawing.Color]::White
 $Form.Controls.Add($RunBtn)
 
 $CloseBtn = New-Object System.Windows.Forms.Button
 $CloseBtn.Text = "Close"
-$CloseBtn.Location = New-Object System.Drawing.Point(580, 444)
-$CloseBtn.Size = New-Object System.Drawing.Size(110, 32)
+$CloseBtn.Location = New-Object System.Drawing.Point(640, 522)
+$CloseBtn.Size = New-Object System.Drawing.Size(124, 32)
+$CloseBtn.Anchor = "Bottom,Right"
 $CloseBtn.Add_Click({ $Form.Close() })
 $Form.Controls.Add($CloseBtn)
 
 # --- Progress bar ---
 $ProgressBar = New-Object System.Windows.Forms.ProgressBar
-$ProgressBar.Location = New-Object System.Drawing.Point(15, 486)
-$ProgressBar.Size = New-Object System.Drawing.Size(680, 18)
+$ProgressBar.Location = New-Object System.Drawing.Point(15, 562)
+$ProgressBar.Size = New-Object System.Drawing.Size(749, 18)
+$ProgressBar.Anchor = "Bottom,Left,Right"
 $Form.Controls.Add($ProgressBar)
 
 # --- Log pane ---
 $LogBox = New-Object System.Windows.Forms.RichTextBox
-$LogBox.Location = New-Object System.Drawing.Point(15, 512)
-$LogBox.Size = New-Object System.Drawing.Size(680, 175)
+$LogBox.Location = New-Object System.Drawing.Point(15, 588)
+$LogBox.Size = New-Object System.Drawing.Size(749, 130)
 $LogBox.ReadOnly = $true
 $LogBox.BackColor = [System.Drawing.Color]::Black
 $LogBox.ForeColor = [System.Drawing.Color]::LightGray
 $LogBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$LogBox.Anchor = "Bottom,Left,Right"
 $Form.Controls.Add($LogBox)
 
 $StatusLabel = New-Object System.Windows.Forms.Label
 $StatusLabel.Text = "Ready. Nothing has been changed yet."
-$StatusLabel.Location = New-Object System.Drawing.Point(15, 695)
-$StatusLabel.Size = New-Object System.Drawing.Size(680, 20)
+$StatusLabel.Location = New-Object System.Drawing.Point(15, 724)
+$StatusLabel.Size = New-Object System.Drawing.Size(749, 20)
+$StatusLabel.Anchor = "Bottom,Left,Right"
 $Form.Controls.Add($StatusLabel)
 
 # ------------------------------------------------------------------
 # RUN LOGIC
 # ------------------------------------------------------------------
+function Get-RunSummaryText {
+    param($SelectedApps)
+    $lines = @()
+    $lines += "Apps to remove ($($SelectedApps.Count)):"
+    if ($SelectedApps.Count -eq 0) {
+        $lines += "  (none)"
+    } else {
+        foreach ($a in $SelectedApps) { $lines += "  - $($a.Display)" }
+    }
+    $lines += ""
+    $lines += "Settings to apply:"
+    if ($chkRestore.Checked)   { $lines += "  - Create System Restore Point" }
+    if ($chkAllUsers.Checked)  { $lines += "  - Remove apps for all users" }
+    if ($chkTelemetry.Checked) { $lines += "  - Reduce telemetry" }
+    if ($chkAds.Checked)       { $lines += "  - Disable ads / suggestions" }
+    if ($chk3D.Checked)        { $lines += "  - Remove '3D Objects' from This PC" }
+    $lines += ""
+    $lines += "Continue?"
+    return ($lines -join "`r`n")
+}
+
 $RunBtn.Add_Click({
+    $SelectedApps = @($script:CurrentApps | Where-Object { $script:Checked[$_.Id] })
+
+    # Confirmation summary - nothing is changed until the user accepts.
+    $summary = Get-RunSummaryText -SelectedApps $SelectedApps
+    $confirm = [System.Windows.Forms.MessageBox]::Show($summary, "Confirm Debloat Run", "OKCancel", "Warning")
+    if ($confirm -ne "OK") {
+        Write-Log "Run cancelled at the confirmation prompt." "Orange"
+        return
+    }
+
     $RunBtn.Enabled = $false
     $CloseBtn.Enabled = $false
     $AppList.Enabled = $false
     $OptionsBox.Enabled = $false
     $ViewCombo.Enabled = $false
     $RefreshBtn.Enabled = $false
+    $PresetCombo.Enabled = $false
+    $SearchBox.Enabled = $false
     $StatusLabel.Text = "Running..."
 
-    $SelectedApps = @()
-    for ($i = 0; $i -lt $AppList.Items.Count; $i++) {
-        if ($AppList.GetItemChecked($i)) { $SelectedApps += $script:CurrentApps[$i] }
-    }
-
+    $script:Results = @()
     $TotalSteps = $SelectedApps.Count + 4
     $ProgressBar.Maximum = [Math]::Max($TotalSteps, 1)
     $ProgressBar.Value = 0
@@ -450,8 +710,10 @@ $RunBtn.Add_Click({
             Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
             Checkpoint-Computer -Description "Pre-Debloat" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
             Write-Log "Restore point created." "LightGreen"
+            Add-Result -Name "System Restore Point" -Outcome "Created"
         } catch {
             Write-Log "Could not create restore point (may be throttled to 1/day): $($_.Exception.Message)" "Orange"
+            Add-Result -Name "System Restore Point" -Outcome "Failed: $($_.Exception.Message)"
         }
     }
     $ProgressBar.Value++
@@ -466,17 +728,21 @@ $RunBtn.Add_Click({
                 if ($app.IsMSI -and $app.ProductCode) {
                     Start-Process -FilePath "msiexec.exe" -ArgumentList "/x $($app.ProductCode) /qn /norestart" -Wait -ErrorAction Stop
                     Write-Log "Silently uninstalled (MSI): $($app.Display)" "LightGreen"
+                    Add-Result -Name $app.Display -Outcome "Uninstalled (MSI)"
                 } else {
                     $cmd = if ($app.QuietUninstallString) { $app.QuietUninstallString } else { $app.UninstallString }
                     if ($cmd) {
                         Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$cmd`"" -Wait -ErrorAction Stop
                         Write-Log "Ran uninstaller for: $($app.Display) (it may have opened its own window - check for prompts)" "LightGreen"
+                        Add-Result -Name $app.Display -Outcome "Uninstaller run"
                     } else {
                         Write-Log "No uninstall command found for: $($app.Display)" "Orange"
+                        Add-Result -Name $app.Display -Outcome "No uninstall command"
                     }
                 }
             } catch {
                 Write-Log "Failed to uninstall $($app.Display): $($_.Exception.Message)" "Orange"
+                Add-Result -Name $app.Display -Outcome "Failed: $($_.Exception.Message)"
             }
             $ProgressBar.Value++
             continue
@@ -500,8 +766,10 @@ $RunBtn.Add_Click({
         }
         if ($removedAny) {
             Write-Log "Removed: $($app.Display)" "LightGreen"
+            Add-Result -Name $app.Display -Outcome "Removed"
         } else {
             Write-Log "Not installed / already removed: $($app.Display)" "Gray"
+            Add-Result -Name $app.Display -Outcome "Not installed"
         }
         $ProgressBar.Value++
     }
@@ -512,12 +780,20 @@ $RunBtn.Add_Click({
         try {
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Name "AllowTelemetry" -Value 1 -Type DWord -Force -ErrorAction Stop
             Write-Log "Diagnostic data set to Basic." "LightGreen"
-        } catch { Write-Log "Could not set diagnostic data level." "Orange" }
+            Add-Result -Name "Diagnostic data level" -Outcome "Set to Basic"
+        } catch {
+            Write-Log "Could not set diagnostic data level." "Orange"
+            Add-Result -Name "Diagnostic data level" -Outcome "Failed"
+        }
 
         try {
             Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy" -Name "TailoredExperiencesWithDiagnosticDataEnabled" -Value 0 -Type DWord -Force -ErrorAction Stop
             Write-Log "Disabled tailored experiences." "LightGreen"
-        } catch { Write-Log "Could not disable tailored experiences." "Orange" }
+            Add-Result -Name "Tailored experiences" -Outcome "Disabled"
+        } catch {
+            Write-Log "Could not disable tailored experiences." "Orange"
+            Add-Result -Name "Tailored experiences" -Outcome "Failed"
+        }
 
         $Tasks = @(
             "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser"
@@ -531,14 +807,20 @@ $RunBtn.Add_Click({
             try {
                 Disable-ScheduledTask -TaskPath (Split-Path $t) -TaskName (Split-Path $t -Leaf) -ErrorAction Stop | Out-Null
                 Write-Log "Disabled task: $t" "LightGreen"
-            } catch { Write-Log "Task not found: $t" "Gray" }
+            } catch {
+                Write-Log "Task not found: $t" "Gray"
+            }
         }
 
         try {
             Stop-Service "DiagTrack" -Force -ErrorAction SilentlyContinue
             Set-Service "DiagTrack" -StartupType Disabled -ErrorAction Stop
             Write-Log "Disabled DiagTrack service." "LightGreen"
-        } catch { Write-Log "Could not disable DiagTrack service." "Orange" }
+            Add-Result -Name "DiagTrack service" -Outcome "Disabled"
+        } catch {
+            Write-Log "Could not disable DiagTrack service." "Orange"
+            Add-Result -Name "DiagTrack service" -Outcome "Failed"
+        }
     }
     $ProgressBar.Value++
 
@@ -563,13 +845,16 @@ $RunBtn.Add_Click({
             } catch { }
         }
         Write-Log "Content delivery / suggestion keys set." "LightGreen"
+        Add-Result -Name "Ads / suggestions" -Outcome "Disabled"
 
         try {
             $UPEPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement"
             if (-not (Test-Path $UPEPath)) { New-Item -Path $UPEPath -Force | Out-Null }
             Set-ItemProperty -Path $UPEPath -Name "ScoobeSystemSettingEnabled" -Value 0 -Type DWord -Force -ErrorAction Stop
             Write-Log "Disabled Windows welcome experience." "LightGreen"
-        } catch { Write-Log "Could not disable welcome experience." "Orange" }
+        } catch {
+            Write-Log "Could not disable welcome experience." "Orange"
+        }
     }
     $ProgressBar.Value++
 
@@ -584,7 +869,11 @@ $RunBtn.Add_Click({
                 if (Test-Path $p) { Remove-Item -Path $p -Recurse -Force -ErrorAction Stop }
             }
             Write-Log "Removed '3D Objects' from This PC." "LightGreen"
-        } catch { Write-Log "Could not remove '3D Objects' entry." "Orange" }
+            Add-Result -Name "'3D Objects' entry" -Outcome "Removed"
+        } catch {
+            Write-Log "Could not remove '3D Objects' entry." "Orange"
+            Add-Result -Name "'3D Objects' entry" -Outcome "Failed"
+        }
     }
     $ProgressBar.Value = $ProgressBar.Maximum
 
@@ -597,9 +886,20 @@ $RunBtn.Add_Click({
     $OptionsBox.Enabled = $true
     $ViewCombo.Enabled = $true
     $RefreshBtn.Enabled = $true
+    $PresetCombo.Enabled = $true
+    $SearchBox.Enabled = $true
+    $ResultsBtn.Enabled = $true
+
+    if ($script:Results.Count -gt 0) { Show-Results }
 
     $reboot = [System.Windows.Forms.MessageBox]::Show("Debloat finished. Reboot now to apply all changes?", "Debloat Tool", "YesNo", "Question")
     if ($reboot -eq "Yes") { Restart-Computer -Force }
 })
+
+# ------------------------------------------------------------------
+# STARTUP
+# ------------------------------------------------------------------
+Update-ListDisplay
+Write-Log "Windows 10 Debloat Tool ready. Nothing has been changed yet." "Cyan"
 
 [void]$Form.ShowDialog()
