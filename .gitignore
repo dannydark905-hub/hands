@@ -1,0 +1,9 @@
+# Inno Setup build output
+dist/
+*.exe
+
+# Runtime log written by the tool next to the script
+Debloat-Log.txt
+
+# Agent-local memory / scratch state
+.openhands/
